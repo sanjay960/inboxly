@@ -1,15 +1,35 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import sqlite3
 from pathlib import Path
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 import jwt
 from passlib.context import CryptContext
 
+# ----------------------------
+# Config
+# ----------------------------
+# ----------------------------
+# Config
+# ----------------------------
+# Use a writable location on Render by default
+DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/inboxly.db"))
+
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+JWT_ALG = "HS256"
+JWT_EXPIRES_DAYS = 7  # token lifetime
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# ----------------------------
+# App
+# ----------------------------
 app = FastAPI(title="Inboxly API")
 
 app.add_middleware(
@@ -23,15 +43,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = Path(__file__).with_name("inboxly.db")
+# ----------------------------
+# Models
+# ----------------------------
+class AuthBody(BaseModel):
+    email: EmailStr
+    password: str
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "")
-JWT_ALG = "HS256"
-JWT_EXPIRES_MIN = 60 * 24 * 7  # 7 days
-
-
+# ----------------------------
+# DB helpers
+# ----------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -83,7 +105,7 @@ def init_db():
         """
     )
 
-    # Indexes
+    # Indexes (scale-safe)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inboxes_user ON inboxes(user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inboxes_expires ON inboxes(expires_at)")
@@ -95,11 +117,14 @@ def init_db():
     conn.close()
 
 
-init_db()
+@app.on_event("startup")
+def _startup():
+    init_db()
 
-# ---------------------------
-# Rate limiting (in-memory MVP)
-# ---------------------------
+
+# ----------------------------
+# Rate limiting (MVP in-memory)
+# ----------------------------
 _rate_buckets: Dict[str, List[float]] = {}
 
 
@@ -121,9 +146,9 @@ def _client_ip(req: Request) -> str:
     return req.client.host if req.client else "unknown"
 
 
-# ---------------------------
-# Auth helpers
-# ---------------------------
+# ----------------------------
+# JWT helpers
+# ----------------------------
 def _require_jwt_secret():
     if not JWT_SECRET:
         raise HTTPException(status_code=503, detail="JWT_SECRET not set on server")
@@ -132,7 +157,7 @@ def _require_jwt_secret():
 def _create_token(user_id: str) -> str:
     _require_jwt_secret()
     now = datetime.now(timezone.utc)
-    exp = now + timedelta(minutes=JWT_EXPIRES_MIN)
+    exp = now + timedelta(days=JWT_EXPIRES_DAYS)
     payload = {"sub": user_id, "iat": int(now.timestamp()), "exp": int(exp.timestamp())}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
@@ -166,18 +191,26 @@ def _get_user(user_id: str) -> sqlite3.Row:
     return row
 
 
-def _require_active_inbox(inbox_id: str):
+# ----------------------------
+# Inbox expiry/ownership helpers
+# ----------------------------
+def _require_active_inbox_owned(inbox_id: str, user_id: str):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT expires_at FROM inboxes WHERE inbox_id = ?", (inbox_id,))
+    cur.execute("SELECT user_id, expires_at FROM inboxes WHERE inbox_id = ?", (inbox_id,))
     row = cur.fetchone()
 
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Inbox not found")
 
+    if row["user_id"] != user_id:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     expires_at = datetime.fromisoformat(row["expires_at"])
     if datetime.now(timezone.utc) >= expires_at:
+        # delete inbox -> cascade messages
         cur.execute("DELETE FROM inboxes WHERE inbox_id = ?", (inbox_id,))
         conn.commit()
         conn.close()
@@ -186,27 +219,27 @@ def _require_active_inbox(inbox_id: str):
     conn.close()
 
 
-# ---------------------------
+# ----------------------------
 # Public
-# ---------------------------
+# ----------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# ---------------------------
-# Auth endpoints (Day 12)
-# ---------------------------
+# ----------------------------
+# Auth (Day 12)
+# ----------------------------
 @app.post("/v1/auth/register")
-def register(req: Request, email: str, password: str):
+def register(body: AuthBody, req: Request):
     ip = _client_ip(req)
     _rate_limit(f"{ip}:register", limit=10, window_seconds=60)
 
-    if "@" not in email or len(password) < 8:
-        raise HTTPException(status_code=400, detail="Invalid email or password too short (min 8)")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password too short (min 8)")
 
     user_id = str(uuid4())
-    pw_hash = pwd_context.hash(password)
+    pw_hash = pwd_context.hash(body.password)
     created_at = datetime.now(timezone.utc).isoformat()
 
     conn = get_db()
@@ -214,7 +247,7 @@ def register(req: Request, email: str, password: str):
     try:
         cur.execute(
             "INSERT INTO users (user_id, email, password_hash, plan, created_at) VALUES (?, ?, ?, 'free', ?)",
-            (user_id, email.lower().strip(), pw_hash, created_at),
+            (user_id, body.email.lower().strip(), pw_hash, created_at),
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -223,25 +256,28 @@ def register(req: Request, email: str, password: str):
     conn.close()
 
     token = _create_token(user_id)
-    return {"token": token, "user": {"user_id": user_id, "email": email, "plan": "free"}}
+    return {"token": token, "user": {"user_id": user_id, "email": body.email, "plan": "free"}}
 
 
 @app.post("/v1/auth/login")
-def login(req: Request, email: str, password: str):
+def login(body: AuthBody, req: Request):
     ip = _client_ip(req)
     _rate_limit(f"{ip}:login", limit=20, window_seconds=60)
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, password_hash, plan FROM users WHERE email = ?", (email.lower().strip(),))
+    cur.execute(
+        "SELECT user_id, password_hash, plan FROM users WHERE email = ?",
+        (body.email.lower().strip(),),
+    )
     row = cur.fetchone()
     conn.close()
 
-    if not row or not pwd_context.verify(password, row["password_hash"]):
+    if not row or not pwd_context.verify(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = _create_token(row["user_id"])
-    return {"token": token, "user": {"user_id": row["user_id"], "email": email, "plan": row["plan"]}}
+    return {"token": token, "user": {"user_id": row["user_id"], "email": body.email, "plan": row["plan"]}}
 
 
 @app.get("/v1/me")
@@ -251,9 +287,9 @@ def me(req: Request):
     return {"user_id": u["user_id"], "email": u["email"], "plan": u["plan"], "created_at": u["created_at"]}
 
 
-# ---------------------------
-# Inbox endpoints now require auth (Day 12)
-# ---------------------------
+# ----------------------------
+# Inboxes (authenticated)
+# ----------------------------
 @app.post("/v1/inbox")
 def create_inbox(req: Request):
     ip = _client_ip(req)
@@ -270,9 +306,10 @@ def create_inbox(req: Request):
     expires_at = now + timedelta(minutes=15)
     created_at = now.isoformat()
 
-    # Count active inboxes
     conn = get_db()
     cur = conn.cursor()
+
+    # Count active inboxes for the user
     cur.execute(
         "SELECT COUNT(*) AS c FROM inboxes WHERE user_id = ? AND expires_at > ?",
         (user_id, now.isoformat()),
@@ -301,29 +338,13 @@ def list_messages(inbox_id: str, req: Request):
     _rate_limit(key=f"{ip}:list_messages", limit=60, window_seconds=60)
 
     user_id = _get_user_id_from_auth(req)
-
-    # Ownership check + expiry check
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, expires_at FROM inboxes WHERE inbox_id = ?", (inbox_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Inbox not found")
-
-    if row["user_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    expires_at = datetime.fromisoformat(row["expires_at"])
-    if datetime.now(timezone.utc) >= expires_at:
-        _require_active_inbox(inbox_id)  # triggers cleanup + 410
+    _require_active_inbox_owned(inbox_id, user_id)
 
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, sender, subject, received_at, preview, body
+        SELECT id, sender, subject, received_at, preview
         FROM messages
         WHERE inbox_id = ?
         ORDER BY received_at DESC
@@ -333,6 +354,7 @@ def list_messages(inbox_id: str, req: Request):
     rows = cur.fetchall()
     conn.close()
 
+    # SaaS: list endpoint should NOT return full body (fetch body via /v1/message/{id})
     messages = [
         {
             "id": r["id"],
@@ -340,11 +362,62 @@ def list_messages(inbox_id: str, req: Request):
             "subject": r["subject"],
             "received_at": r["received_at"],
             "preview": r["preview"],
-            "body": r["body"],
         }
         for r in rows
     ]
+
     return {"inbox_id": inbox_id, "messages": messages}
+
+
+@app.get("/v1/message/{message_id}")
+def get_message(message_id: str, req: Request):
+    ip = _client_ip(req)
+    _rate_limit(key=f"{ip}:get_message", limit=120, window_seconds=60)
+
+    user_id = _get_user_id_from_auth(req)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Join messages -> inboxes to enforce ownership + expiry
+    cur.execute(
+        """
+        SELECT m.id, m.inbox_id, m.sender, m.subject, m.received_at, m.body,
+               i.user_id, i.expires_at
+        FROM messages m
+        JOIN inboxes i ON i.inbox_id = m.inbox_id
+        WHERE m.id = ?
+        """,
+        (message_id,),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if row["user_id"] != user_id:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if datetime.now(timezone.utc) >= expires_at:
+        # delete inbox -> cascade messages
+        cur.execute("DELETE FROM inboxes WHERE inbox_id = ?", (row["inbox_id"],))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=410, detail="Inbox expired")
+
+    conn.close()
+
+    return {
+        "id": row["id"],
+        "inbox_id": row["inbox_id"],
+        "from": row["sender"],
+        "subject": row["subject"],
+        "received_at": row["received_at"],
+        "body": row["body"],
+    }
 
 
 @app.post("/v1/inbox/{inbox_id}/test-email")
@@ -353,22 +426,7 @@ def send_test_email(inbox_id: str, req: Request):
     _rate_limit(key=f"{ip}:test_email", limit=60, window_seconds=60)
 
     user_id = _get_user_id_from_auth(req)
-
-    # Ownership check
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, expires_at FROM inboxes WHERE inbox_id = ?", (inbox_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Inbox not found")
-    if row["user_id"] != user_id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    expires_at = datetime.fromisoformat(row["expires_at"])
-    if datetime.now(timezone.utc) >= expires_at:
-        _require_active_inbox(inbox_id)  # cleanup + 410
+    _require_active_inbox_owned(inbox_id, user_id)
 
     now = datetime.now(timezone.utc).isoformat()
     msg_id = str(uuid4())
@@ -378,8 +436,8 @@ def send_test_email(inbox_id: str, req: Request):
         "from": "test@inboxly.dev",
         "subject": "Welcome to Inboxly (Test)",
         "received_at": now,
-        "preview": "Day 12: message stored for your user inbox.",
-        "body": "Hi! This is a fake message. Day 12 adds users + JWT + plans.",
+        "preview": "Message stored in your user-owned inbox.",
+        "body": "Hi! This is a fake message for local testing.",
     }
 
     conn = get_db()
@@ -397,9 +455,9 @@ def send_test_email(inbox_id: str, req: Request):
     return msg
 
 
-# ---------------------------
-# Admin cleanup (Bearer auth) remains (Day 10.5)
-# ---------------------------
+# ----------------------------
+# Admin cleanup (Bearer admin key)
+# ----------------------------
 @app.post("/admin/cleanup-expired")
 def cleanup_expired(req: Request):
     admin_key = os.environ.get("INBOXLY_ADMIN_KEY")
@@ -423,6 +481,7 @@ def cleanup_expired(req: Request):
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) AS c FROM inboxes WHERE expires_at <= ?", (now,))
     inbox_count = int(cur.fetchone()["c"])
+
     cur.execute("DELETE FROM inboxes WHERE expires_at <= ?", (now,))
     conn.commit()
     conn.close()
