@@ -15,8 +15,8 @@ from passlib.context import CryptContext
 # Config
 # ----------------------------
 # Render-safe SQLite path:
-# - On Render: set DB_PATH=/tmp/inboxly.db (writable) or attach a disk and point DB_PATH to that mount.
-# - Locally: it will default to /tmp/inboxly.db unless you override DB_PATH.
+# - Recommended on Render: set DB_PATH=/tmp/inboxly.db (writable)
+# - Or attach a disk and set DB_PATH to that disk mount for persistence
 DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/inboxly.db"))
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
@@ -53,7 +53,7 @@ class AuthBody(BaseModel):
 # DB helpers
 # ----------------------------
 def get_db():
-    # Ensure parent dir exists (useful if DB_PATH points to a mounted directory)
+    # Ensure parent directory exists (useful if DB_PATH points to a mounted directory)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(DB_PATH)
@@ -118,7 +118,7 @@ def init_db():
     conn.close()
 
 
-# Init at import (local) + startup (Render restarts)
+# Init at import + on startup (safer for Render restarts)
 init_db()
 
 
@@ -152,15 +152,18 @@ def _client_ip(req: Request) -> str:
 
 
 # ----------------------------
-# Password helper (bcrypt 72-byte limit)
+# Password helpers (bcrypt 72-byte limit)
 # ----------------------------
 def _normalize_password(raw: str) -> str:
     pw = (raw or "").strip()
+
     if len(pw) < 8:
         raise HTTPException(status_code=400, detail="Password too short (min 8)")
-    # bcrypt limit: 72 bytes (NOT characters)
+
+    # bcrypt limit is 72 BYTES (not 72 characters)
     if len(pw.encode("utf-8")) > 72:
         raise HTTPException(status_code=400, detail="Password too long (max 72 bytes)")
+
     return pw
 
 
@@ -253,11 +256,16 @@ def register(body: AuthBody, req: Request):
     ip = _client_ip(req)
     _rate_limit(f"{ip}:register", limit=10, window_seconds=60)
 
-    # Normalize + enforce bcrypt rules
     pw = _normalize_password(body.password)
 
     user_id = str(uuid4())
-    pw_hash = pwd_context.hash(pw)
+
+    # Safety net: never let bcrypt error become 500
+    try:
+        pw_hash = pwd_context.hash(pw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Password too long (max 72 bytes)")
+
     created_at = datetime.now(timezone.utc).isoformat()
 
     conn = get_db()
@@ -293,7 +301,13 @@ def login(body: AuthBody, req: Request):
     row = cur.fetchone()
     conn.close()
 
-    if not row or not pwd_context.verify(pw, row["password_hash"]):
+    # Safety net: bcrypt verify should not throw 500
+    try:
+        ok = bool(row) and pwd_context.verify(pw, row["password_hash"])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Password too long (max 72 bytes)")
+
+    if not ok:
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = _create_token(row["user_id"])
@@ -319,7 +333,6 @@ def create_inbox(req: Request):
     user = _get_user(user_id)
     plan = user["plan"]
 
-    # Plan limits
     max_active = 1 if plan == "free" else 10
 
     now = datetime.now(timezone.utc)
@@ -329,7 +342,6 @@ def create_inbox(req: Request):
     conn = get_db()
     cur = conn.cursor()
 
-    # Count active inboxes for the user
     cur.execute(
         "SELECT COUNT(*) AS c FROM inboxes WHERE user_id = ? AND expires_at > ?",
         (user_id, now.isoformat()),
@@ -374,7 +386,6 @@ def list_messages(inbox_id: str, req: Request):
     rows = cur.fetchall()
     conn.close()
 
-    # SaaS: list endpoint should NOT return full body
     messages = [
         {
             "id": r["id"],
@@ -399,7 +410,6 @@ def get_message(message_id: str, req: Request):
     conn = get_db()
     cur = conn.cursor()
 
-    # Join messages -> inboxes to enforce ownership + expiry
     cur.execute(
         """
         SELECT m.id, m.inbox_id, m.sender, m.subject, m.received_at, m.body,
@@ -422,7 +432,6 @@ def get_message(message_id: str, req: Request):
 
     expires_at = datetime.fromisoformat(row["expires_at"])
     if datetime.now(timezone.utc) >= expires_at:
-        # delete inbox -> cascade messages
         cur.execute("DELETE FROM inboxes WHERE inbox_id = ?", (row["inbox_id"],))
         conn.commit()
         conn.close()
