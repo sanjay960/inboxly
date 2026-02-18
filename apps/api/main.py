@@ -483,6 +483,13 @@ def send_test_email(inbox_id: str, req: Request):
 
     return msg
 
+@app.post("/debug/password-bytes")
+def debug_password_bytes(body: AuthBody):
+    # DO NOT return password; only return lengths
+    return {
+        "password_chars": len(body.password or ""),
+        "password_bytes": len((body.password or "").encode("utf-8")),
+    }
 
 # ----------------------------
 # Admin cleanup (Bearer admin key)
