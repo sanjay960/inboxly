@@ -18,7 +18,8 @@ from passlib.context import CryptContext
 # Config
 # ----------------------------
 # Use a writable location on Render by default
-DB_PATH = Path(__file__).with_name("inboxly.db")
+#DB_PATH = Path(__file__).with_name("inboxly.db")
+DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/inboxly.db"))
 
 
 
