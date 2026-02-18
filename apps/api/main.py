@@ -18,7 +18,8 @@ from passlib.context import CryptContext
 # Config
 # ----------------------------
 # Use a writable location on Render by default
-DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/inboxly.db"))
+DB_PATH = Path(__file__).with_name("inboxly.db")
+
 
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
@@ -117,10 +118,7 @@ def init_db():
     conn.close()
 
 
-@app.on_event("startup")
-def _startup():
-    init_db()
-
+init_db()
 
 # ----------------------------
 # Rate limiting (MVP in-memory)
