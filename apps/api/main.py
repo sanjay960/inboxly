@@ -249,15 +249,17 @@ def send_test_email(inbox_id: str, req: Request):
 # Admin cleanup endpoint (Day 10)
 # ---------------------------
 @app.post("/admin/cleanup-expired")
-def cleanup_expired(req: Request, key: str):
-    # Require admin key from env
+def cleanup_expired(req: Request):
     admin_key = os.environ.get("INBOXLY_ADMIN_KEY")
     if not admin_key:
-        raise HTTPException(
-            status_code=503,
-            detail="INBOXLY_ADMIN_KEY not set on server",
-        )
-    if key != admin_key:
+        raise HTTPException(status_code=503, detail="INBOXLY_ADMIN_KEY not set on server")
+
+    auth = req.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token>")
+
+    token = auth.split(" ", 1)[1].strip()
+    if token != admin_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Optional: rate limit cleanup too
