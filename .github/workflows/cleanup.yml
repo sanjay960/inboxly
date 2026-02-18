@@ -1,0 +1,17 @@
+name: Inboxly Cleanup
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call cleanup endpoint
+        env:
+          ADMIN_KEY: ${{ secrets.INBOXLY_ADMIN_KEY }}
+        run: |
+          curl -sS -X POST "https://inboxly-api.onrender.com/admin/cleanup-expired" \
+            -H "Authorization: Bearer ${ADMIN_KEY}"
