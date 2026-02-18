@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 
 const STORAGE_KEY = "inboxly_current_inbox_v1";
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
 
 type InboxResponse = {
   inbox_id: string;
@@ -92,7 +94,7 @@ export default function Home() {
     setExpiredNotice(null);
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/v1/inbox", {
+      const res = await fetch(`${API_BASE}/v1/inbox`, {
         method: "POST",
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -121,7 +123,7 @@ export default function Home() {
 
   async function fetchMessages(id: string) {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/v1/inbox/${id}/messages`);
+      const res = await fetch(`${API_BASE}/v1/inbox/${id}/messages`);
 
       // Day 7: handle expiry from backend
       if (res.status === 410) {
@@ -157,7 +159,7 @@ export default function Home() {
 
     try {
       const res = await fetch(
-        `http://127.0.0.1:8000/v1/inbox/${inbox.inbox_id}/test-email`,
+        `${API_BASE}/v1/inbox/${inbox.inbox_id}/test-email`,
         { method: "POST" }
       );
 
@@ -304,7 +306,7 @@ export default function Home() {
         )}
 
         <p className="text-xs text-gray-500 text-center">
-          Day 7: expiry enforced (410 Gone) + auto-clear.
+          Day 9: frontend uses env-based API URL (Render/Vercel ready).
         </p>
       </div>
     </main>
