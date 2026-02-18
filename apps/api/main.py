@@ -14,14 +14,10 @@ from passlib.context import CryptContext
 # ----------------------------
 # Config
 # ----------------------------
-# ----------------------------
-# Config
-# ----------------------------
-# Use a writable location on Render by default
-#DB_PATH = Path(__file__).with_name("inboxly.db")
+# Render-safe SQLite path:
+# - On Render: set DB_PATH=/tmp/inboxly.db (writable) or attach a disk and point DB_PATH to that mount.
+# - Locally: it will default to /tmp/inboxly.db unless you override DB_PATH.
 DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/inboxly.db"))
-
-
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALG = "HS256"
@@ -32,7 +28,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="Inboxly API")
+app = FastAPI(title="Inboxly API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +53,9 @@ class AuthBody(BaseModel):
 # DB helpers
 # ----------------------------
 def get_db():
+    # Ensure parent dir exists (useful if DB_PATH points to a mounted directory)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -119,7 +118,14 @@ def init_db():
     conn.close()
 
 
+# Init at import (local) + startup (Render restarts)
 init_db()
+
+
+@app.on_event("startup")
+def _startup():
+    init_db()
+
 
 # ----------------------------
 # Rate limiting (MVP in-memory)
@@ -143,6 +149,19 @@ def _rate_limit(key: str, limit: int, window_seconds: int) -> None:
 
 def _client_ip(req: Request) -> str:
     return req.client.host if req.client else "unknown"
+
+
+# ----------------------------
+# Password helper (bcrypt 72-byte limit)
+# ----------------------------
+def _normalize_password(raw: str) -> str:
+    pw = (raw or "").strip()
+    if len(pw) < 8:
+        raise HTTPException(status_code=400, detail="Password too short (min 8)")
+    # bcrypt limit: 72 bytes (NOT characters)
+    if len(pw.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password too long (max 72 bytes)")
+    return pw
 
 
 # ----------------------------
@@ -227,18 +246,18 @@ def health():
 
 
 # ----------------------------
-# Auth (Day 12)
+# Auth
 # ----------------------------
 @app.post("/v1/auth/register")
 def register(body: AuthBody, req: Request):
     ip = _client_ip(req)
     _rate_limit(f"{ip}:register", limit=10, window_seconds=60)
 
-    if len(body.password) < 8:
-        raise HTTPException(status_code=400, detail="Password too short (min 8)")
+    # Normalize + enforce bcrypt rules
+    pw = _normalize_password(body.password)
 
     user_id = str(uuid4())
-    pw_hash = pwd_context.hash(body.password)
+    pw_hash = pwd_context.hash(pw)
     created_at = datetime.now(timezone.utc).isoformat()
 
     conn = get_db()
@@ -263,6 +282,8 @@ def login(body: AuthBody, req: Request):
     ip = _client_ip(req)
     _rate_limit(f"{ip}:login", limit=20, window_seconds=60)
 
+    pw = _normalize_password(body.password)
+
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -272,7 +293,7 @@ def login(body: AuthBody, req: Request):
     row = cur.fetchone()
     conn.close()
 
-    if not row or not pwd_context.verify(body.password, row["password_hash"]):
+    if not row or not pwd_context.verify(pw, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     token = _create_token(row["user_id"])
@@ -353,7 +374,7 @@ def list_messages(inbox_id: str, req: Request):
     rows = cur.fetchall()
     conn.close()
 
-    # SaaS: list endpoint should NOT return full body (fetch body via /v1/message/{id})
+    # SaaS: list endpoint should NOT return full body
     messages = [
         {
             "id": r["id"],
