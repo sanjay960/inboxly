@@ -379,7 +379,7 @@ def list_messages(inbox_id: str, req: Request):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, sender, subject, received_at, preview, body
+        SELECT id, sender, subject, received_at, preview
         FROM messages
         WHERE inbox_id = ?
         ORDER BY received_at DESC
@@ -396,11 +396,68 @@ def list_messages(inbox_id: str, req: Request):
             "subject": r["subject"],
             "received_at": r["received_at"],
             "preview": r["preview"],
-            "body": r["body"],
         }
         for r in rows
     ]
+
     return {"inbox_id": inbox_id, "messages": messages}
+
+@app.get("/v1/message/{message_id}")
+def get_message(message_id: str, req: Request):
+    ip = _client_ip(req)
+    _rate_limit(key=f"{ip}:get_message", limit=120, window_seconds=60)
+
+    user_id = _get_user_id_from_auth(req)
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            m.id,
+            m.inbox_id,
+            m.sender,
+            m.subject,
+            m.received_at,
+            m.body,
+            i.user_id AS owner_user_id,
+            i.expires_at AS inbox_expires_at
+        FROM messages m
+        JOIN inboxes i ON i.inbox_id = m.inbox_id
+        WHERE m.id = ?
+        """,
+        (message_id,),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if row["owner_user_id"] != user_id:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    expires_at = datetime.fromisoformat(row["inbox_expires_at"])
+    if datetime.now(timezone.utc) >= expires_at:
+        cur.execute("DELETE FROM inboxes WHERE inbox_id = ?", (row["inbox_id"],))
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=410, detail="Inbox expired")
+
+    conn.close()
+
+    return {
+        "id": row["id"],
+        "inbox_id": row["inbox_id"],
+        "from": row["sender"],
+        "subject": row["subject"],
+        "received_at": row["received_at"],
+        "body": row["body"],
+    }
+
+ 
 
 
 @app.post("/v1/inbox/{inbox_id}/test-email")
