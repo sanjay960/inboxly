@@ -542,3 +542,41 @@ def cleanup_expired(req: Request):
         conn.commit()
 
     return {"deleted_inboxes": inbox_count, "timestamp": now.isoformat()}
+
+
+@app.post("/admin/set-plan")
+def admin_set_plan(req: Request, email: str, plan: str):
+    admin_key = os.environ.get("INBOXLY_ADMIN_KEY")
+    if not admin_key:
+        raise HTTPException(status_code=503, detail="INBOXLY_ADMIN_KEY not set on server")
+
+    auth = req.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization: Bearer <token>")
+
+    token = auth.split(" ", 1)[1].strip()
+    if token != admin_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    plan = plan.strip().lower()
+    if plan not in ("free", "pro"):
+        raise HTTPException(status_code=400, detail="Invalid plan. Use 'free' or 'pro'.")
+
+    email_norm = email.strip().lower()
+    if not email_norm:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET plan = %s WHERE email = %s RETURNING user_id, email, plan",
+                (plan, email_norm),
+            )
+            row = cur.fetchone()
+        conn.commit()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"updated": True, "user": row}
+
