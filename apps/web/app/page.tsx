@@ -5,7 +5,6 @@ import { useEffect, useMemo, useState } from "react";
 const STORAGE_KEY = "inboxly_current_inbox_v1";
 const TOKEN_KEY = "inboxly_jwt_v1";
 
-// Support both env names
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ||
   process.env.NEXT_PUBLIC_API_BASE_URL ||
@@ -92,7 +91,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [expiredNotice, setExpiredNotice] = useState<string | null>(null);
 
-  // Restore saved inbox metadata
+  // Restore saved inbox (local metadata)
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -104,7 +103,7 @@ export default function Home() {
     }
   }, []);
 
-  // Save inbox metadata
+  // Persist inbox metadata
   useEffect(() => {
     if (!inbox) {
       clearStoredInbox();
@@ -122,24 +121,53 @@ export default function Home() {
   // Load /v1/me if token exists
   useEffect(() => {
     if (!getToken()) return;
-    refreshMe();
+    refreshMeAndRestore();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function refreshMe() {
-    setError(null);
     try {
       const res = await apiFetch("/v1/me");
+      if (res.status === 401) {
+        logout();
+        return null;
+      }
+      if (!res.ok) return null;
+      const data = await res.json();
+      const out = { email: data.email as string, plan: data.plan as Plan };
+      setMe(out);
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  async function restoreActiveInboxFromServer(planHint?: Plan) {
+    try {
+      const res = await apiFetch("/v1/inboxes/active");
       if (res.status === 401) {
         logout();
         return;
       }
       if (!res.ok) return;
       const data = await res.json();
-      setMe({ email: data.email, plan: data.plan });
+      const first = Array.isArray(data.inboxes) ? data.inboxes[0] : null;
+      if (!first) return;
+
+      setInbox({
+        inbox_id: first.inbox_id,
+        address: first.address,
+        expires_at: first.expires_at,
+        plan: planHint ?? me?.plan ?? "free",
+      });
     } catch {
       // ignore
     }
+  }
+
+  async function refreshMeAndRestore() {
+    const m = await refreshMe();
+    if (m) await restoreActiveInboxFromServer(m.plan);
   }
 
   async function register() {
@@ -160,40 +188,14 @@ export default function Home() {
       setToken(out.token);
       setMe({ email: out.user.email, plan: out.user.plan });
 
-      await restoreActiveInboxFromServer();
-
-
-      // clear old inbox on account change
-      setInbox(null);
-      setMessages([]);
-      setSelected(null);
-      clearStoredInbox();
+      // try restore inbox if any active
+      await restoreActiveInboxFromServer(out.user.plan);
     } catch (e: any) {
       setError(e?.message ?? "Register failed");
     } finally {
       setLoadingAuth(false);
     }
   }
-
-  async function restoreActiveInboxFromServer() {
-  try {
-    const res = await apiFetch("/v1/inboxes/active");
-    if (!res.ok) return;
-    const data = await res.json();
-    const first = Array.isArray(data.inboxes) ? data.inboxes[0] : null;
-    if (!first) return;
-
-    // Match your InboxResponse shape
-    setInbox({
-      inbox_id: first.inbox_id,
-      address: first.address,
-      expires_at: first.expires_at,
-      plan: me?.plan ?? "free",
-    });
-  } catch {
-    // ignore
-  }
-}
 
   async function login() {
     setLoadingAuth(true);
@@ -213,13 +215,8 @@ export default function Home() {
       setToken(out.token);
       setMe({ email: out.user.email, plan: out.user.plan });
 
-      await restoreActiveInboxFromServer();
-
-
-      setInbox(null);
-      setMessages([]);
-      setSelected(null);
-      clearStoredInbox();
+      // restore active inbox after login
+      await restoreActiveInboxFromServer(out.user.plan);
     } catch (e: any) {
       setError(e?.message ?? "Login failed");
     } finally {
@@ -287,7 +284,7 @@ export default function Home() {
       const data = await res.json().catch(() => ({}));
 
       if (res.status === 402) {
-        throw new Error(data?.detail ?? "Plan limit reached: wait for expiry or upgrade.");
+        throw new Error(data?.detail ?? "Plan limit reached");
       }
 
       if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
@@ -299,6 +296,31 @@ export default function Home() {
       setError(e?.message ?? "Failed to generate inbox");
     } finally {
       setLoadingInbox(false);
+    }
+  }
+
+  async function deleteInbox() {
+    if (!inbox) return;
+    setError(null);
+
+    try {
+      const res = await apiFetch(`/v1/inbox/${inbox.inbox_id}`, { method: "DELETE" });
+
+      if (res.status === 401) {
+        logout();
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
+
+      // clear local state
+      setInbox(null);
+      setMessages([]);
+      setSelected(null);
+      clearStoredInbox();
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to delete inbox");
     }
   }
 
@@ -322,10 +344,7 @@ export default function Home() {
 
       if (res.status === 410) {
         setExpiredNotice("Inbox expired (server). Generate a new inbox.");
-        setInbox(null);
-        setMessages([]);
-        setSelected(null);
-        clearStoredInbox();
+        clearInboxLocal();
         return;
       }
 
@@ -363,10 +382,7 @@ export default function Home() {
 
       if (res.status === 410) {
         setExpiredNotice("Inbox expired (server). Generate a new inbox.");
-        setInbox(null);
-        setMessages([]);
-        setSelected(null);
-        clearStoredInbox();
+        clearInboxLocal();
         return;
       }
 
@@ -392,16 +408,11 @@ export default function Home() {
     setError(null);
 
     try {
-      const res = await apiFetch(`/v1/inbox/${inbox.inbox_id}/test-email`, {
-        method: "POST",
-      });
+      const res = await apiFetch(`/v1/inbox/${inbox.inbox_id}/test-email`, { method: "POST" });
 
       if (res.status === 410) {
         setExpiredNotice("Inbox expired (server). Generate a new inbox.");
-        setInbox(null);
-        setMessages([]);
-        setSelected(null);
-        clearStoredInbox();
+        clearInboxLocal();
         return;
       }
 
@@ -418,24 +429,6 @@ export default function Home() {
       setError(e?.message ?? "Failed to send test email");
     }
   }
-
-  async function deleteInbox() {
-  if (!inbox) return;
-  setError(null);
-
-  try {
-    const res = await apiFetch(`/v1/inbox/${inbox.inbox_id}`, { method: "DELETE" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
-
-    clearInboxLocal(); // reuse your existing local clear
-  } catch (e: any) {
-    setError(e?.message ?? "Failed to delete inbox");
-  }
-}
-
-
-
 
   return (
     <main className="min-h-screen flex items-center justify-center bg-gray-100 p-6">
@@ -538,19 +531,18 @@ export default function Home() {
                 </button>
 
                 <button
+                  onClick={deleteInbox}
+                  className="px-3 py-1 rounded-lg border text-sm hover:bg-gray-50"
+                >
+                  Delete
+                </button>
+
+                <button
                   onClick={clearInboxLocal}
                   className="px-3 py-1 rounded-lg border text-sm hover:bg-gray-50"
                 >
                   Clear
                 </button>
-
-                <button
-  onClick={deleteInbox}
-  className="px-3 py-1 rounded-lg border text-sm hover:bg-gray-50"
->
-  Delete
-</button>
-
               </div>
             </div>
 
@@ -594,7 +586,9 @@ export default function Home() {
               )}
 
               {messages.length === 0 ? (
-                <div className="text-xs text-gray-500">No messages yet… (auto-refresh every 10s)</div>
+                <div className="text-xs text-gray-500">
+                  No messages yet… (auto-refresh every 10s)
+                </div>
               ) : (
                 <div className="space-y-2 max-h-56 overflow-y-auto">
                   {messages.map((msg) => (
@@ -625,7 +619,7 @@ export default function Home() {
         )}
 
         <p className="text-xs text-gray-500 text-center">
-          Proper SaaS: list shows preview only; open fetches full body from server.
+          SaaS mode: JWT + active inbox restore + preview list + open message + delete inbox + admin tools.
         </p>
       </div>
     </main>

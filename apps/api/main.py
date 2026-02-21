@@ -5,23 +5,29 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import jwt
 from passlib.context import CryptContext
 
-import psycopg
-from psycopg.rows import dict_row
 
-# ----------------------------
-# Config
-# ----------------------------
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+from sqlalchemy import create_engine
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Force psycopg2 driver (prevents psycopg v3 import)
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALG = "HS256"
-JWT_EXPIRES_DAYS = 7
+JWT_EXPIRES_DAYS = 7  # token lifetime
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 
 # ----------------------------
 # App
@@ -39,12 +45,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ----------------------------
 # Models
 # ----------------------------
 class AuthBody(BaseModel):
     email: EmailStr
     password: str
+
 
 # ----------------------------
 # DB helpers (Postgres / Neon)
@@ -53,12 +61,12 @@ def _require_db():
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="DATABASE_URL not set on server")
 
+
 def get_db():
     _require_db()
-    # Neon requires SSL; the provided URL usually includes sslmode=require.
-    # We use dict_row so rows behave like dicts (like sqlite Row).
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    return conn
+    # Neon pooled URL typically already includes sslmode=require.
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
 
 def init_db():
     _require_db()
@@ -75,7 +83,6 @@ def init_db():
                 );
                 """
             )
-
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS inboxes (
@@ -87,7 +94,6 @@ def init_db():
                 );
                 """
             )
-
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -112,14 +118,17 @@ def init_db():
 
         conn.commit()
 
+
 @app.on_event("startup")
 def startup():
     init_db()
+
 
 # ----------------------------
 # Rate limiting (MVP in-memory)
 # ----------------------------
 _rate_buckets: Dict[str, List[float]] = {}
+
 
 def _rate_limit(key: str, limit: int, window_seconds: int) -> None:
     now = time.time()
@@ -134,23 +143,23 @@ def _rate_limit(key: str, limit: int, window_seconds: int) -> None:
     bucket.append(now)
     _rate_buckets[key] = bucket
 
+
 def _client_ip(req: Request) -> str:
     return req.client.host if req.client else "unknown"
+
 
 # ----------------------------
 # Password helpers (bcrypt safety)
 # ----------------------------
 def _normalize_password(raw: str) -> str:
     pw = (raw or "").strip()
-
     if len(pw) < 8:
         raise HTTPException(status_code=400, detail="Password too short (min 8)")
-
-    # bcrypt limit: 72 BYTES
+    # bcrypt limit is 72 BYTES
     if len(pw.encode("utf-8")) > 72:
         raise HTTPException(status_code=400, detail="Password too long (max 72 bytes)")
-
     return pw
+
 
 # ----------------------------
 # JWT helpers
@@ -159,12 +168,14 @@ def _require_jwt_secret():
     if not JWT_SECRET:
         raise HTTPException(status_code=503, detail="JWT_SECRET not set on server")
 
+
 def _create_token(user_id: str) -> str:
     _require_jwt_secret()
     now = datetime.now(timezone.utc)
     exp = now + timedelta(days=JWT_EXPIRES_DAYS)
     payload = {"sub": user_id, "iat": int(now.timestamp()), "exp": int(exp.timestamp())}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
 
 def _get_user_id_from_auth(req: Request) -> str:
     _require_jwt_secret()
@@ -183,6 +194,7 @@ def _get_user_id_from_auth(req: Request) -> str:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
 def _get_user(user_id: str) -> dict:
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -195,16 +207,14 @@ def _get_user(user_id: str) -> dict:
         raise HTTPException(status_code=401, detail="User not found")
     return row
 
+
 # ----------------------------
-# Inbox helpers
+# Inbox expiry/ownership helpers
 # ----------------------------
 def _require_active_inbox_owned(inbox_id: str, user_id: str):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT user_id, expires_at FROM inboxes WHERE inbox_id = %s",
-                (inbox_id,),
-            )
+            cur.execute("SELECT user_id, expires_at FROM inboxes WHERE inbox_id = %s", (inbox_id,))
             row = cur.fetchone()
 
             if not row:
@@ -215,10 +225,10 @@ def _require_active_inbox_owned(inbox_id: str, user_id: str):
 
             expires_at: datetime = row["expires_at"]
             if datetime.now(timezone.utc) >= expires_at:
-                # delete inbox -> cascade messages
                 cur.execute("DELETE FROM inboxes WHERE inbox_id = %s", (inbox_id,))
                 conn.commit()
                 raise HTTPException(status_code=410, detail="Inbox expired")
+
 
 # ----------------------------
 # Public
@@ -226,6 +236,7 @@ def _require_active_inbox_owned(inbox_id: str, user_id: str):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # ----------------------------
 # Auth
@@ -263,6 +274,7 @@ def register(body: AuthBody, req: Request):
     token = _create_token(user_id)
     return {"token": token, "user": {"user_id": user_id, "email": body.email, "plan": "free"}}
 
+
 @app.post("/v1/auth/login")
 def login(body: AuthBody, req: Request):
     ip = _client_ip(req)
@@ -293,11 +305,18 @@ def login(body: AuthBody, req: Request):
     token = _create_token(row["user_id"])
     return {"token": token, "user": {"user_id": row["user_id"], "email": body.email, "plan": row["plan"]}}
 
+
 @app.get("/v1/me")
 def me(req: Request):
     user_id = _get_user_id_from_auth(req)
     u = _get_user(user_id)
-    return {"user_id": u["user_id"], "email": u["email"], "plan": u["plan"], "created_at": u["created_at"].isoformat()}
+    return {
+        "user_id": u["user_id"],
+        "email": u["email"],
+        "plan": u["plan"],
+        "created_at": u["created_at"].isoformat(),
+    }
+
 
 # ----------------------------
 # Inboxes
@@ -373,6 +392,30 @@ def list_active_inboxes(req: Request):
     return {"inboxes": inboxes}
 
 
+@app.delete("/v1/inbox/{inbox_id}")
+def delete_inbox(inbox_id: str, req: Request):
+    ip = _client_ip(req)
+    _rate_limit(key=f"{ip}:delete_inbox", limit=30, window_seconds=60)
+
+    user_id = _get_user_id_from_auth(req)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM inboxes WHERE inbox_id = %s", (inbox_id,))
+            row = cur.fetchone()
+
+            if not row:
+                raise HTTPException(status_code=404, detail="Inbox not found")
+
+            if row["user_id"] != user_id:
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+            cur.execute("DELETE FROM inboxes WHERE inbox_id = %s", (inbox_id,))
+        conn.commit()
+
+    return {"deleted": True, "inbox_id": inbox_id}
+
+
 @app.get("/v1/inbox/{inbox_id}/messages")
 def list_messages(inbox_id: str, req: Request):
     ip = _client_ip(req)
@@ -406,6 +449,7 @@ def list_messages(inbox_id: str, req: Request):
     ]
 
     return {"inbox_id": inbox_id, "messages": messages}
+
 
 @app.get("/v1/message/{message_id}")
 def get_message(message_id: str, req: Request):
@@ -456,6 +500,7 @@ def get_message(message_id: str, req: Request):
         "body": row["body"],
     }
 
+
 @app.post("/v1/inbox/{inbox_id}/test-email")
 def send_test_email(inbox_id: str, req: Request):
     ip = _client_ip(req)
@@ -487,30 +532,15 @@ def send_test_email(inbox_id: str, req: Request):
             )
         conn.commit()
 
-    return msg
+    return {
+        "id": msg_id,
+        "from": msg["from"],
+        "subject": msg["subject"],
+        "received_at": msg["received_at"].isoformat(),
+        "preview": msg["preview"],
+        "body": msg["body"],
+    }
 
-@app.delete("/v1/inbox/{inbox_id}")
-def delete_inbox(inbox_id: str, req: Request):
-    ip = _client_ip(req)
-    _rate_limit(key=f"{ip}:delete_inbox", limit=30, window_seconds=60)
-
-    user_id = _get_user_id_from_auth(req)
-
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id FROM inboxes WHERE inbox_id = %s", (inbox_id,))
-            row = cur.fetchone()
-
-            if not row:
-                raise HTTPException(status_code=404, detail="Inbox not found")
-
-            if row["user_id"] != user_id:
-                raise HTTPException(status_code=403, detail="Forbidden")
-
-            cur.execute("DELETE FROM inboxes WHERE inbox_id = %s", (inbox_id,))
-        conn.commit()
-
-    return {"deleted": True, "inbox_id": inbox_id}
 
 # ----------------------------
 # Admin cleanup
@@ -544,6 +574,9 @@ def cleanup_expired(req: Request):
     return {"deleted_inboxes": inbox_count, "timestamp": now.isoformat()}
 
 
+# ----------------------------
+# Admin plan upgrade (Stripe-ready)
+# ----------------------------
 @app.post("/admin/set-plan")
 def admin_set_plan(req: Request, email: str, plan: str):
     admin_key = os.environ.get("INBOXLY_ADMIN_KEY")
@@ -579,4 +612,3 @@ def admin_set_plan(req: Request, email: str, plan: str):
         raise HTTPException(status_code=404, detail="User not found")
 
     return {"updated": True, "user": row}
-
