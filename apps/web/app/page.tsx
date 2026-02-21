@@ -5,17 +5,19 @@ import { useEffect, useMemo, useState } from "react";
 const STORAGE_KEY = "inboxly_current_inbox_v1";
 const TOKEN_KEY = "inboxly_jwt_v1";
 
-// Support both env names to avoid breaking your current setup
+// Support both env names
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ||
   process.env.NEXT_PUBLIC_API_BASE_URL ||
   "http://127.0.0.1:8000";
 
+type Plan = "free" | "pro";
+
 type InboxResponse = {
   inbox_id: string;
   address: string;
   expires_at: string;
-  plan: "free" | "pro";
+  plan: Plan;
 };
 
 type MessageListItem = {
@@ -37,7 +39,7 @@ type MessageDetail = {
 
 type AuthResponse = {
   token: string;
-  user: { user_id: string; email: string; plan: "free" | "pro" };
+  user: { user_id: string; email: string; plan: Plan };
 };
 
 function getToken(): string | null {
@@ -57,6 +59,14 @@ function setToken(token: string | null) {
   }
 }
 
+function clearStoredInbox() {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 async function apiFetch(path: string, init: RequestInit = {}) {
   const token = getToken();
   const headers = new Headers(init.headers || {});
@@ -65,24 +75,24 @@ async function apiFetch(path: string, init: RequestInit = {}) {
 }
 
 export default function Home() {
-  // Auth UI
+  // Auth
   const [authEmail, setAuthEmail] = useState("test@example.com");
   const [authPassword, setAuthPassword] = useState("password123");
-  const [me, setMe] = useState<{ email: string; plan: "free" | "pro" } | null>(null);
+  const [me, setMe] = useState<{ email: string; plan: Plan } | null>(null);
 
-  // Inbox UI
+  // Inbox + messages
   const [inbox, setInbox] = useState<InboxResponse | null>(null);
   const [messages, setMessages] = useState<MessageListItem[]>([]);
   const [selected, setSelected] = useState<MessageDetail | null>(null);
 
-  const [loading, setLoading] = useState(false);
-  const [openingMsg, setOpeningMsg] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [loadingAuth, setLoadingAuth] = useState(false);
+  const [loadingInbox, setLoadingInbox] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState(false);
 
-  // Notices
+  const [error, setError] = useState<string | null>(null);
   const [expiredNotice, setExpiredNotice] = useState<string | null>(null);
 
-  // Restore saved inbox on first load
+  // Restore saved inbox metadata
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -90,22 +100,26 @@ export default function Home() {
       const parsed: InboxResponse = JSON.parse(raw);
       setInbox(parsed);
     } catch {
-      localStorage.removeItem(STORAGE_KEY);
+      clearStoredInbox();
     }
   }, []);
 
-  // Save inbox whenever it changes
+  // Save inbox metadata
   useEffect(() => {
     if (!inbox) {
-      localStorage.removeItem(STORAGE_KEY);
+      clearStoredInbox();
       setMessages([]);
       setSelected(null);
       return;
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(inbox));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(inbox));
+    } catch {
+      // ignore
+    }
   }, [inbox]);
 
-  // If token exists, load /v1/me
+  // Load /v1/me if token exists
   useEffect(() => {
     if (!getToken()) return;
     refreshMe();
@@ -116,6 +130,10 @@ export default function Home() {
     setError(null);
     try {
       const res = await apiFetch("/v1/me");
+      if (res.status === 401) {
+        logout();
+        return;
+      }
       if (!res.ok) return;
       const data = await res.json();
       setMe({ email: data.email, plan: data.plan });
@@ -125,7 +143,7 @@ export default function Home() {
   }
 
   async function register() {
-    setLoading(true);
+    setLoadingAuth(true);
     setError(null);
     setExpiredNotice(null);
 
@@ -135,20 +153,50 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: authEmail, password: authPassword }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
+
       const out = data as AuthResponse;
       setToken(out.token);
       setMe({ email: out.user.email, plan: out.user.plan });
+
+      await restoreActiveInboxFromServer();
+
+
+      // clear old inbox on account change
+      setInbox(null);
+      setMessages([]);
+      setSelected(null);
+      clearStoredInbox();
     } catch (e: any) {
       setError(e?.message ?? "Register failed");
     } finally {
-      setLoading(false);
+      setLoadingAuth(false);
     }
   }
 
+  async function restoreActiveInboxFromServer() {
+  try {
+    const res = await apiFetch("/v1/inboxes/active");
+    if (!res.ok) return;
+    const data = await res.json();
+    const first = Array.isArray(data.inboxes) ? data.inboxes[0] : null;
+    if (!first) return;
+
+    // Match your InboxResponse shape
+    setInbox({
+      inbox_id: first.inbox_id,
+      address: first.address,
+      expires_at: first.expires_at,
+      plan: me?.plan ?? "free",
+    });
+  } catch {
+    // ignore
+  }
+}
+
   async function login() {
-    setLoading(true);
+    setLoadingAuth(true);
     setError(null);
     setExpiredNotice(null);
 
@@ -158,15 +206,24 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: authEmail, password: authPassword }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
+
       const out = data as AuthResponse;
       setToken(out.token);
       setMe({ email: out.user.email, plan: out.user.plan });
+
+      await restoreActiveInboxFromServer();
+
+
+      setInbox(null);
+      setMessages([]);
+      setSelected(null);
+      clearStoredInbox();
     } catch (e: any) {
       setError(e?.message ?? "Login failed");
     } finally {
-      setLoading(false);
+      setLoadingAuth(false);
     }
   }
 
@@ -178,9 +235,10 @@ export default function Home() {
     setSelected(null);
     setExpiredNotice(null);
     setError(null);
+    clearStoredInbox();
   }
 
-  // Tick every second to update countdown
+  // Countdown tick
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setTick((x) => x + 1), 1000);
@@ -190,8 +248,7 @@ export default function Home() {
   const remainingSeconds = useMemo(() => {
     if (!inbox) return 0;
     const expiresMs = new Date(inbox.expires_at).getTime();
-    const nowMs = Date.now();
-    return Math.max(0, Math.floor((expiresMs - nowMs) / 1000));
+    return Math.max(0, Math.floor((expiresMs - Date.now()) / 1000));
   }, [inbox, tick]);
 
   const mmss = useMemo(() => {
@@ -202,38 +259,46 @@ export default function Home() {
 
   const expired = inbox !== null && remainingSeconds === 0;
 
-  // If local timer reaches 0, clear inbox
   useEffect(() => {
     if (!inbox) return;
     if (expired) {
       setExpiredNotice("Inbox expired. Generate a new inbox.");
       setInbox(null);
+      setMessages([]);
+      setSelected(null);
+      clearStoredInbox();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expired]);
 
   async function generateInbox() {
-    setLoading(true);
+    setLoadingInbox(true);
     setError(null);
     setExpiredNotice(null);
 
     try {
-      const res = await apiFetch(`/v1/inbox`, { method: "POST" });
+      const res = await apiFetch("/v1/inbox", { method: "POST" });
 
       if (res.status === 401) {
-        throw new Error("Unauthorized. Please login first.");
+        logout();
+        throw new Error("Unauthorized. Please login again.");
       }
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+
+      if (res.status === 402) {
+        throw new Error(data?.detail ?? "Plan limit reached: wait for expiry or upgrade.");
+      }
+
       if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
 
       setInbox(data as InboxResponse);
-      setSelected(null);
       setMessages([]);
+      setSelected(null);
     } catch (e: any) {
-      setError(e?.message ?? "Unknown error");
+      setError(e?.message ?? "Failed to generate inbox");
     } finally {
-      setLoading(false);
+      setLoadingInbox(false);
     }
   }
 
@@ -242,43 +307,43 @@ export default function Home() {
     await navigator.clipboard.writeText(inbox.address);
   }
 
-  function clearInbox() {
+  function clearInboxLocal() {
     setInbox(null);
     setExpiredNotice(null);
     setError(null);
     setSelected(null);
     setMessages([]);
+    clearStoredInbox();
   }
 
-  async function fetchMessages(id: string) {
+  async function fetchMessages(inboxId: string) {
     try {
-      const res = await apiFetch(`/v1/inbox/${id}/messages`);
+      const res = await apiFetch(`/v1/inbox/${inboxId}/messages`);
 
-      // Expiry from backend
       if (res.status === 410) {
         setExpiredNotice("Inbox expired (server). Generate a new inbox.");
         setInbox(null);
+        setMessages([]);
+        setSelected(null);
+        clearStoredInbox();
         return;
       }
 
       if (res.status === 401) {
-        setError("Unauthorized. Please login again.");
-        setToken(null);
-        setMe(null);
-        setInbox(null);
+        logout();
         return;
       }
 
       if (!res.ok) return;
 
       const data = await res.json();
-      setMessages(Array.isArray(data.messages) ? (data.messages as MessageListItem[]) : []);
+      const list = Array.isArray(data.messages) ? (data.messages as MessageListItem[]) : [];
+      setMessages(list);
     } catch {
-      // ignore network errors for now
+      // ignore
     }
   }
 
-  // Auto-fetch messages when inbox exists, refresh every 10s (Free spec)
   useEffect(() => {
     if (!inbox) return;
 
@@ -287,11 +352,10 @@ export default function Home() {
 
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inbox]);
+  }, [inbox?.inbox_id]);
 
   async function openMessage(messageId: string) {
-    if (!inbox) return;
-    setOpeningMsg(true);
+    setLoadingMsg(true);
     setError(null);
 
     try {
@@ -300,25 +364,25 @@ export default function Home() {
       if (res.status === 410) {
         setExpiredNotice("Inbox expired (server). Generate a new inbox.");
         setInbox(null);
+        setMessages([]);
+        setSelected(null);
+        clearStoredInbox();
         return;
       }
 
       if (res.status === 401) {
-        setError("Unauthorized. Please login again.");
-        setToken(null);
-        setMe(null);
-        setInbox(null);
+        logout();
         return;
       }
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
 
       setSelected(data as MessageDetail);
     } catch (e: any) {
       setError(e?.message ?? "Failed to open message");
     } finally {
-      setOpeningMsg(false);
+      setLoadingMsg(false);
     }
   }
 
@@ -335,18 +399,18 @@ export default function Home() {
       if (res.status === 410) {
         setExpiredNotice("Inbox expired (server). Generate a new inbox.");
         setInbox(null);
+        setMessages([]);
+        setSelected(null);
+        clearStoredInbox();
         return;
       }
 
       if (res.status === 401) {
-        setError("Unauthorized. Please login again.");
-        setToken(null);
-        setMe(null);
-        setInbox(null);
+        logout();
         return;
       }
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
 
       fetchMessages(inbox.inbox_id);
@@ -355,19 +419,35 @@ export default function Home() {
     }
   }
 
+  async function deleteInbox() {
+  if (!inbox) return;
+  setError(null);
+
+  try {
+    const res = await apiFetch(`/v1/inbox/${inbox.inbox_id}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
+
+    clearInboxLocal(); // reuse your existing local clear
+  } catch (e: any) {
+    setError(e?.message ?? "Failed to delete inbox");
+  }
+}
+
+
+
+
   return (
     <main className="min-h-screen flex items-center justify-center bg-gray-100 p-6">
       <div className="bg-white p-8 rounded-2xl shadow-md w-full max-w-md space-y-5">
         <h1 className="text-2xl font-semibold text-center">Inboxly</h1>
 
-        {/* Notices */}
         {expiredNotice && (
           <div className="bg-amber-50 text-amber-800 p-3 rounded-xl text-sm">
             {expiredNotice}
           </div>
         )}
 
-        {/* Auth */}
         {!me ? (
           <div className="space-y-3">
             <div className="rounded-xl border p-3 space-y-2">
@@ -378,6 +458,7 @@ export default function Home() {
                 onChange={(e) => setAuthEmail(e.target.value)}
                 className="w-full px-3 py-2 rounded-lg border text-sm"
                 placeholder="Email"
+                autoComplete="email"
               />
               <input
                 value={authPassword}
@@ -385,28 +466,29 @@ export default function Home() {
                 className="w-full px-3 py-2 rounded-lg border text-sm"
                 placeholder="Password (min 8)"
                 type="password"
+                autoComplete="current-password"
               />
 
               <div className="flex gap-2">
                 <button
                   onClick={login}
-                  disabled={loading}
+                  disabled={loadingAuth}
                   className="flex-1 px-4 py-2 rounded-xl border hover:bg-gray-50 disabled:opacity-50"
                 >
-                  {loading ? "..." : "Login"}
+                  {loadingAuth ? "..." : "Login"}
                 </button>
                 <button
                   onClick={register}
-                  disabled={loading}
+                  disabled={loadingAuth}
                   className="flex-1 px-4 py-2 rounded-xl border hover:bg-gray-50 disabled:opacity-50"
                 >
-                  {loading ? "..." : "Register"}
+                  {loadingAuth ? "..." : "Register"}
                 </button>
               </div>
             </div>
 
             <p className="text-xs text-gray-500 text-center">
-              JWT mode is enabled. Login first to create inbox and read messages.
+              SaaS mode: JWT auth required to create inbox and read messages.
             </p>
           </div>
         ) : (
@@ -424,15 +506,14 @@ export default function Home() {
           </div>
         )}
 
-        {/* Inbox */}
         {!inbox ? (
           <button
             onClick={generateInbox}
-            disabled={loading || !me}
+            disabled={loadingInbox || !me}
             className="w-full px-4 py-2 rounded-xl border hover:bg-gray-50 disabled:opacity-50"
             title={!me ? "Login first" : ""}
           >
-            {loading ? "Generating..." : "Generate Inbox"}
+            {loadingInbox ? "Generating..." : "Generate Inbox"}
           </button>
         ) : (
           <div className="space-y-3">
@@ -450,18 +531,26 @@ export default function Home() {
 
                 <button
                   onClick={generateInbox}
-                  disabled={loading}
+                  disabled={loadingInbox}
                   className="px-3 py-1 rounded-lg border text-sm hover:bg-gray-50 disabled:opacity-50"
                 >
-                  {loading ? "..." : "New Inbox"}
+                  {loadingInbox ? "..." : "New Inbox"}
                 </button>
 
                 <button
-                  onClick={clearInbox}
+                  onClick={clearInboxLocal}
                   className="px-3 py-1 rounded-lg border text-sm hover:bg-gray-50"
                 >
                   Clear
                 </button>
+
+                <button
+  onClick={deleteInbox}
+  className="px-3 py-1 rounded-lg border text-sm hover:bg-gray-50"
+>
+  Delete
+</button>
+
               </div>
             </div>
 
@@ -470,7 +559,6 @@ export default function Home() {
               <div className="font-mono text-lg">{mmss}</div>
             </div>
 
-            {/* Messages */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <h2 className="text-sm font-medium">Messages</h2>
@@ -482,13 +570,10 @@ export default function Home() {
                 </button>
               </div>
 
-              {/* Selected message details */}
               {selected && (
                 <div className="border rounded-xl p-3 text-sm bg-white">
                   <div className="flex items-center justify-between gap-3">
-                    <div className="font-semibold break-words">
-                      {selected.subject}
-                    </div>
+                    <div className="font-semibold break-words">{selected.subject}</div>
                     <button
                       onClick={() => setSelected(null)}
                       className="px-2 py-1 border rounded text-xs hover:bg-gray-50"
@@ -497,23 +582,19 @@ export default function Home() {
                     </button>
                   </div>
 
-                  <div className="mt-2 text-xs text-gray-600">
-                    From: {selected.from}
-                  </div>
+                  <div className="mt-2 text-xs text-gray-600">From: {selected.from}</div>
                   <div className="text-xs text-gray-600">
                     Received: {new Date(selected.received_at).toLocaleString()}
                   </div>
 
                   <div className="mt-3 whitespace-pre-wrap text-sm">
-                    {openingMsg ? "Loading..." : selected.body}
+                    {loadingMsg ? "Loading..." : selected.body}
                   </div>
                 </div>
               )}
 
               {messages.length === 0 ? (
-                <div className="text-xs text-gray-500">
-                  No messages yet… (auto-refresh every 10s)
-                </div>
+                <div className="text-xs text-gray-500">No messages yet… (auto-refresh every 10s)</div>
               ) : (
                 <div className="space-y-2 max-h-56 overflow-y-auto">
                   {messages.map((msg) => (
@@ -544,7 +625,7 @@ export default function Home() {
         )}
 
         <p className="text-xs text-gray-500 text-center">
-          SaaS mode: JWT auth + inbox + messages list (preview) + open message endpoint.
+          Proper SaaS: list shows preview only; open fetches full body from server.
         </p>
       </div>
     </main>
